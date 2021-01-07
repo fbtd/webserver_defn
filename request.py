@@ -1,4 +1,5 @@
 import socket, typing
+from collections import defaultdict
 
 def iter_lines(sock: socket.socket, bufsize: int = 16_384) -> typing.Generator[bytes, None, bytes]:
     """Given a socket, read all the individual CRLF-separated lines and yield
@@ -19,6 +20,22 @@ def iter_lines(sock: socket.socket, bufsize: int = 16_384) -> typing.Generator[b
                 yield line
             except IndexError:
                 break
+
+class Headers:
+    def __init__(self) -> None:
+        self._headers = defaultdict(list)
+
+    def add(self, name:str, value:str) -> None:
+        self._headers[name.lower()].append(value)
+
+    def get_all(self, name:str) -> typing.List[str]:
+        return self._headers[name.lower()]
+
+    def get(self, name:str, default: typing.Optional[str] = None) -> typing.Optional[str]:
+        try:
+            return self.get_all(name)[-1]
+        except IndexError:
+            return default
 
 class Request(typing.NamedTuple):
     method: str
