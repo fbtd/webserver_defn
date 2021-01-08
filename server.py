@@ -77,10 +77,25 @@ if __name__ == "__main__":
                 try:
                     client_request = Request.from_socket(client_sock)
                     log(f"Client request: {client_request}")
-                    if client_request.method != "GET":
+
+                    try:
+                        content_length = int(client_request.headers.get("content-length") or 0)
+                    except ValueError:
+                        content_length = 0
+
+                    if client_request.method == "GET":
+                        serve_file(client_sock, client_request.path)
+                    elif client_request.method == "POST":
+                        if "100-continue" in client_request.headers.get("expect", ""):
+                            log("sending \"100 Continue\" to client")
+                            client_sock.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    else:
                         client_sock.sendall(RESPONSE_405)
-                        break
-                    serve_file(client_sock, client_request.path)
+
+                    if content_length:
+                        body = client_request.body.read(content_length)
+                        log(f"Request body: {body}")
+
                 except Exception as e:
                     log(f"faield to parse request: {e}")
                     client_sock.sendall(RESPONSE_400)

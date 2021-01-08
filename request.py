@@ -1,5 +1,5 @@
-import socket, typing
-from collections import defaultdict
+import io, socket, typing
+from headers import Headers
 
 def iter_lines(sock: socket.socket, bufsize: int = 16_384) -> typing.Generator[bytes, None, bytes]:
     """Given a socket, read all the individual CRLF-separated lines and yield
@@ -21,26 +21,33 @@ def iter_lines(sock: socket.socket, bufsize: int = 16_384) -> typing.Generator[b
             except IndexError:
                 break
 
-class Headers:
-    def __init__(self) -> None:
-        self._headers = defaultdict(list)
+class BodyReader(io.IOBase):
+    def __init__(self, sock:socket.socket, *, buff: bytes = b"", bufsize: int = 16_384) -> None:
+        self._sock = sock
+        self._buff = buff
+        self._bufsize = bufsize 
 
-    def add(self, name:str, value:str) -> None:
-        self._headers[name.lower()].append(value)
+    def readable(self) -> bool:
+        return True
 
-    def get_all(self, name:str) -> typing.List[str]:
-        return self._headers[name.lower()]
+    def read(self, n:int) -> bytes:
+        """Read up to n bytes from the request body
+        """
 
-    def get(self, name:str, default: typing.Optional[str] = None) -> typing.Optional[str]:
-        try:
-            return self.get_all(name)[-1]
-        except IndexError:
-            return default
+        while len(self._buff) < n:
+            data = self._sock.recv(self._bufsize)
+            if not data:
+                break
+            self._buff += data
+
+        res, self._buff = self._buff[:n], self._buff[n:]
+        return res
 
 class Request(typing.NamedTuple):
     method: str
     path: str
-    headers: typing.Mapping[str, str]
+    headers: Headers
+    body: BodyReader
     
     @classmethod
     def from_socket(cls, sock: socket.socket) -> "Request":
@@ -60,12 +67,21 @@ class Request(typing.NamedTuple):
         except ValueError:
             raise ValueError("Malformed request line: {request_line!r}")
 
-        headers = dict()
-        for line in lines:
+        headers = Headers()
+        buff = b""
+        while True:
+            try:
+                line = next(lines)
+            except StopIteration as e:
+                # StopIteration.vale contains the return value of the generator
+                buff = e.value
+                break
+
             try:
                 name, _, value = line.decode("ascii").partition(":")
-                headers[name.lower()] = value.lstrip()
+                headers.add(name, value.lstrip())
             except ValueError:
                 raise ValueError("Malformed header line: {line!r}")
 
-        return cls(method=method.upper(), path=path, headers=headers)
+        body = BodyReader(sock, buff=buff)
+        return cls(method=method.upper(), path=path, headers=headers, body=body)
