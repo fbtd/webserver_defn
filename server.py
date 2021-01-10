@@ -1,6 +1,7 @@
-import socket, typing, os, mimetypes
+import io, socket, typing, os, mimetypes
 from datetime import datetime
 
+from response import *
 from request import Request
 
 HOST = "127.0.0.1"
@@ -12,18 +13,6 @@ Content-type: {content_type}
 Content-length: {content_length}
 
 """.replace("\n", "\r\n")
-
-def response(body:str, code:str="200 OK", content_type:str="text/html") -> bytes:
-    body_b = body.encode()
-    content_length = len(body_b)
-    return b"HTTP/1.1 " + bytes(code, "ascii") + b"\r\n" + \
-           b"Content-type: "  + bytes(content_type, "ascii") + b"\r\n" + \
-           b"Content-length: " + bytes(str(content_length), "ascii") + \
-           b"\r\n\r\n" + body_b
-RESPONSE_200 = response("Hello web!")
-RESPONSE_400 = response("Bad request", code="400 Bad Request")
-RESPONSE_404 = response("Not found", code="404 Not found")
-RESPONSE_405 = response("Method Not Allowed", code="405 Method Not Allowed")
 
 def log(msg: str) -> None:
      print(datetime.now().strftime("%x %X"), msg, sep=" - ")
@@ -37,65 +26,72 @@ def serve_file(sock: socket.socket, path:str) -> None:
 
     abspath = os.path.normpath(os.path.join(SERVER_ROOT, path.lstrip("/")))
     if not abspath.startswith(SERVER_ROOT):
-        sock.sendall(RESPONSE_404)
+        RESPONSE_404.send(sock)
         return
 
     try:
         with open(abspath, "rb") as f:
-            stat = os.fstat(f.fileno())
             content_type, encoding = mimetypes.guess_type(abspath)
             if content_type is None:
                 content_type = "application/octet-stream"
             if encoding is not None:
                 content_type += f"; charset={encoding}"
 
-            response_header = FILE_RESPONSE_TEMPLATE.format(
-                content_type=content_type,
-                content_length=stat.st_size,
-            ).encode("ascii")
+            response = Response(status="200 OK", body=f)
+            response.headers.add("content-type", content_type)
+            response.send(sock)
 
-            sock.sendall(response_header)
-            sock.sendfile(f)
     except FileNotFoundError:
-        sock.sendall(RESPONSE_404)
+        RESPONSE_404.send(sock)
         return
 
-if __name__ == "__main__":
-    with socket.socket() as server_sock:
-        # tells the Kernel to reuse sockets in "TIME_WAIT" state
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+class HTTPServer:
+    def __init__(self, host="127.0.0.1", port=9000) -> None:
+        self.host = host
+        self.port = port
 
-        server_sock.bind((HOST, PORT))
+    def serve_forever(self) -> None:
+        with socket.socket() as server_sock:
+            # tells the Kernel to reuse sockets in "TIME_WAIT" state
+            server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_sock.bind((HOST, PORT))
 
-        server_sock.listen(0)
-        log(f"Listening on {HOST}:{PORT}...")
+            server_sock.listen(0)
+            log(f"Listening on {HOST}:{PORT}...")
 
-        while True:
-            client_sock, client_addr = server_sock.accept()
-            log(f"New connection from {client_addr}")
-            with client_sock:
+            while True:
+                client_sock, client_addr = server_sock.accept()
+                self.handle_client(client_sock, client_addr)
+
+    def handle_client(self, client_sock: socket.socket, client_addr: typing.Tuple[str, int]) -> None:
+        log(f"New connection from {client_addr}")
+        with client_sock:
+            try:
+                client_request = Request.from_socket(client_sock)
+                log(f"Client request: {client_request}")
+
                 try:
-                    client_request = Request.from_socket(client_sock)
-                    log(f"Client request: {client_request}")
+                    content_length = int(client_request.headers.get("content-length") or 0)
+                except ValueError:
+                    content_length = 0
 
-                    try:
-                        content_length = int(client_request.headers.get("content-length") or 0)
-                    except ValueError:
-                        content_length = 0
+                if client_request.method == "GET":
+                    serve_file(client_sock, client_request.path)
+                elif client_request.method == "POST":
+                    if "100-continue" in client_request.headers.get("expect", ""):
+                        log("sending \"100 Continue\" to client")
+                        RESPONSE_100.send(client_sock)
+                else:
+                    RESPONSE_405.send(client_sock)
 
-                    if client_request.method == "GET":
-                        serve_file(client_sock, client_request.path)
-                    elif client_request.method == "POST":
-                        if "100-continue" in client_request.headers.get("expect", ""):
-                            log("sending \"100 Continue\" to client")
-                            client_sock.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
-                    else:
-                        client_sock.sendall(RESPONSE_405)
+                if content_length:
+                    body = client_request.body.read(content_length)
+                    log(f"Request body: {body}")
 
-                    if content_length:
-                        body = client_request.body.read(content_length)
-                        log(f"Request body: {body}")
+            except Exception as e:
+                log(f"faield to parse request: {e}")
+                RESPONSE_400.send(client_sock)
 
-                except Exception as e:
-                    log(f"faield to parse request: {e}")
-                    client_sock.sendall(RESPONSE_400)
+if __name__ == "__main__":
+    server = HTTPServer()
+    server.serve_forever()
