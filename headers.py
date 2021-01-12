@@ -6,7 +6,7 @@ HeadersGenerator = typing.Generator[typing.Tuple[str, str], None, None]
 
 class Headers:
     def __init__(self) -> None:
-        self._headers = defaultdict(list)
+        self._headers: HeadersDict = defaultdict(list)
 
     def add(self, name:str, value:str) -> None:
         self._headers[name.lower()].append(value)
@@ -14,7 +14,7 @@ class Headers:
     def get_all(self, name:str) -> typing.List[str]:
         return self._headers[name.lower()]
 
-    def get(self, name:str, default: typing.Optional[str] = None) -> typing.Optional[str]:
+    def get(self, name:str, default: str = "") -> str:
         try:
             return self.get_all(name)[-1]
         except IndexError:

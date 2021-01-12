@@ -2,54 +2,49 @@ import io, socket, typing, os, mimetypes
 from datetime import datetime
 import threading, queue
 
-from response import *
 from request import Request
+from response import *
 
-HOST = "127.0.0.1"
-PORT = 9000
+HandlerT = typing.Callable[[Request], Response]
+
 SERVER_ROOT = os.path.abspath('www')
-FILE_RESPONSE_TEMPLATE = """\
-HTTP/1.1 200 OK
-Content-type: {content_type}
-Content-length: {content_length}
-
-""".replace("\n", "\r\n")
 
 def log(msg: str) -> None:
      print(datetime.now().strftime("%x %X"), msg, sep=" - ")
 
-def serve_file(sock: socket.socket, path:str) -> None:
-    """Given a socket and the relative (to SERVER_ROOT) path to a file, send
-    that file to the socet if it exists. If not, send a 404 Response
+def serve_static(server_root: str = SERVER_ROOT) -> HandlerT:
+    """Generate a request handler that serve a file
     """
-    if path == "/":
-        path = "/index.html"
+    def handler(request: Request) -> Response:
+        path = request.path
+        if path == "/":
+            path = "/index.html"
 
-    abspath = os.path.normpath(os.path.join(SERVER_ROOT, path.lstrip("/")))
-    if not abspath.startswith(SERVER_ROOT):
-        RESPONSE_404.send(sock)
-        return
-
-    try:
-        with open(abspath, "rb") as f:
+        abspath = os.path.normpath(os.path.join(server_root, path.lstrip("/")))
+        if not abspath.startswith(server_root):
+            response = Response(status = "404 Not found", content = "Not found")
+            return
+        try:
             content_type, encoding = mimetypes.guess_type(abspath)
             if content_type is None:
                 content_type = "application/octet-stream"
             if encoding is not None:
                 content_type += f"; charset={encoding}"
-
-            response = Response(status="200 OK", body=f)
+            body_file = open(abspath, "rb")
+            response = Response(status="200 OK", body=body_file)
             response.headers.add("content-type", content_type)
-            response.send(sock)
-
-    except FileNotFoundError:
-        RESPONSE_404.send(sock)
-        return
+            log(f"file found {path}")
+            return response
+        except FileNotFoundError:
+            return Response(status = "404 Not found", content = "Not found")
+    return handler
 
 class HTTPWorker(threading.Thread):
-    def __init__(self, connection_queue: queue.Queue) -> None:
+    def __init__(self, connection_queue: queue.Queue,
+                 handlers: typing.List[typing.Tuple[str, HandlerT]]) -> None:
         super().__init__(daemon=True)
         self.connection_queue = connection_queue
+        self.handlers = handlers
         self.running = False
 
     def stop(self) -> None:
@@ -74,53 +69,73 @@ class HTTPWorker(threading.Thread):
         log(f"New connection from {client_addr}")
         with client_sock:
             try:
-                client_request = Request.from_socket(client_sock)
-                log(f"Client request: {client_request}")
-
-                try:
-                    content_length = int(client_request.headers.get("content-length") or 0)
-                except ValueError:
-                    content_length = 0
-
-                if client_request.method == "GET":
-                    serve_file(client_sock, client_request.path)
-                elif client_request.method == "POST":
-                    if "100-continue" in client_request.headers.get("expect", ""):
-                        log("sending \"100 Continue\" to client")
-                        RESPONSE_100.send(client_sock)
-                else:
-                    RESPONSE_405.send(client_sock)
-
-                if content_length:
-                    body = client_request.body.read(content_length)
-                    log(f"Request body: {body}")
-
+                request = Request.from_socket(client_sock)
+                log(f"Client request: {request}")
             except Exception as e:
                 log(f"faield to parse request: {e}")
-                RESPONSE_400.send(client_sock)
+                Response(status = "400 Bad request", content = "Bad request").send(client_sock)
+                return
 
+            # force the client to send the full body, so that the handler does
+            # not have to deal with this
+            if "100-continue" in request.headers.get("expect", ""):
+                log("sending \"100 Continue\" to client")
+                Response(status = "100 Continue").send(client_sock)
+
+            for path_prefix, handler in self.handlers:
+                if request.path.startswith(path_prefix):
+                    try:
+                        request = request._replace(path=request.path[len(path_prefix):])
+                        response = handler(request)
+                        response.send(client_sock)
+                    except Exception as e:
+                        log(f"unexpected error from handler {handler}: {e}")
+                        Response(status = "500 Internal Server Error", content = "Internal Server Error").send(client_sock)
+                    finally:
+                        break
+            else:
+                Response(status = "500 Internal Server Error", content = "Internal Server Error").send(client_sock)
+
+def app(request: Request) -> Response:
+    return Response(status="200 OK", content="hello web!")
+
+def wrap_auth(handler: HandlerT, token: str) -> HandlerT:
+    def auth_handler(request: Request) -> Response:
+        authorization = request.headers.get("authorization", "")
+        if authorization.startswith("Bearer ") and \
+           authorization[len("Bearer "):] == token:
+            return handler(request)
+        return Response(status="403 Forbidden", content="get out!")
+    return auth_handler
 
 class HTTPServer:
     def __init__(self, host="127.0.0.1", port=9000, worker_count=16) -> None:
+        self.handlers = list()
         self.host = host
         self.port = port
         self.worker_count = worker_count
         self.worker_backlog = worker_count * 8
         self.connection_queue = queue.Queue(self.worker_backlog)
 
+    def mount(self, path_prefix:str, handler: HandlerT) -> None:
+        """Mount a request handler at a particular path. Handler prefixes are
+        tested in the order that they are added
+        """
+        self.handlers.append((path_prefix, handler))
+
     def serve_forever(self) -> None:
         workers = list()
         for _ in range(self.worker_count):
-            worker = HTTPWorker(self.connection_queue)
+            worker = HTTPWorker(self.connection_queue, self.handlers)
             worker.start()
             workers.append(worker)
 
         with socket.socket() as server_sock:
             # tells the Kernel to reuse sockets in "TIME_WAIT" state
             server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_sock.bind((HOST, PORT))
+            server_sock.bind((self.host, self.port))
             server_sock.listen(self.worker_backlog)
-            log(f"Listening on {HOST}:{PORT}...")
+            log(f"Listening on {self.host}:{self.port}...")
 
             while True:
                 try:
@@ -136,4 +151,7 @@ class HTTPServer:
 
 if __name__ == "__main__":
     server = HTTPServer()
+    server.mount("/static", serve_static())
+    server.mount("/secure", wrap_auth(serve_static(), token="t0kEn"))
+    server.mount("", app)
     server.serve_forever()
